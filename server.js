@@ -18,6 +18,7 @@ const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 const gameManager = require("./gameManager");
+const contractCaller = require("./contractCaller");
 
 const app = express();
 const server = http.createServer(app);
@@ -124,6 +125,7 @@ io.on("connection", (socket) => {
     socket.join(roomId);
 
     if (!rooms[roomId]) {
+      const matchKey = roomId + "-" + Date.now();
       rooms[roomId] = {
         players: {},
         moves: {},
@@ -135,10 +137,14 @@ io.on("connection", (socket) => {
         stakeMST: Number(stakeMST) || 1,
         escrowReady: false,
         readyPlayers: new Set(),
+        // Escrow tracking
+        escrowDeposits: new Set(),   // socket ids jinhone deposit confirm kiya
+        escrowVerified: false,       // contract pe isFunded() confirmed
+        matchKey,                    // unique key for matchId generation
         rpsWinner: null,
         finished: false,
       };
-      log(roomId, "Room created", `stake=${rooms[roomId].stakeMST}`);
+      log(roomId, "Room created", `stake=${rooms[roomId].stakeMST} matchKey=${matchKey}`);
     }
 
     const room = rooms[roomId];
@@ -195,9 +201,22 @@ io.on("connection", (socket) => {
 
     if (room.readyPlayers.size >= 2) {
       room.escrowReady = true;
-      io.to(roomId).emit("game_start", { roomId });
-      startMoveTimeout(roomId);
-      log(roomId, "🎮 GAME START");
+      log(roomId, "Both ready — escrow check pending", room.matchKey);
+      tryStartGame(roomId);
+    }
+  });
+
+  // ── ESCROW CONFIRMED (client deposit ke baad bhejta hai) ──────────
+  socket.on("escrow_confirmed", ({ roomId, txHash }) => {
+    const room = rooms[roomId];
+    if (!room) return reject(socket, roomId, "Room not found");
+
+    room.escrowDeposits.add(socket.id);
+    log(roomId, `escrow_confirmed ${room.escrowDeposits.size}/2`, `from=${socket.id} tx=${txHash || "none"}`);
+
+    if (room.escrowDeposits.size >= 2) {
+      log(roomId, "Both deposits confirmed — escrow verify kar raha hu");
+      tryStartGame(roomId);
     }
   });
 
@@ -317,6 +336,70 @@ io.on("connection", (socket) => {
     }
   });
 });
+
+// ─────────────────────────────────────────
+// ESCROW VERIFICATION + GAME START
+// ─────────────────────────────────────────
+
+/**
+ * tryStartGame — dono conditions check karke game shuru karta hai:
+ *   1. readyPlayers.size >= 2 (dono ne Start dabaya)
+ *   2. Contract pe isFunded() = true (dono ka MSTC locked hai)
+ *
+ * Testing ke liye SKIP_ESCROW_CHECK=true .env mein set karo —
+ * tab escrow verify nahi hoga aur seedha game shuru ho jaayega.
+ */
+async function tryStartGame(roomId) {
+  const room = rooms[roomId];
+  if (!room || room.finished) return;
+
+  if (room.readyPlayers.size < 2) {
+    log(roomId, "tryStartGame: dono ready nahi hain abhi");
+    return;
+  }
+
+  // SKIP_ESCROW_CHECK=true: local dev / testing ke liye
+  if (process.env.SKIP_ESCROW_CHECK === "true") {
+    warn(roomId, "SKIP_ESCROW_CHECK=true — escrow verify nahi ho raha!");
+    room.escrowReady = true;
+    io.to(roomId).emit("game_start", { roomId });
+    startMoveTimeout(roomId);
+    log(roomId, "🎮 GAME START (escrow skipped)");
+    return;
+  }
+
+  // Escrow contract check
+  try {
+    const funded = await contractCaller.isFunded(room.matchKey);
+    if (!funded) {
+      log(roomId, "Escrow not funded yet — dono players ka deposit wait kar raha hu",
+        `matchKey=${room.matchKey}`);
+
+      // Players ko inform karo ki deposit pending hai
+      io.to(roomId).emit("escrow_pending", {
+        matchKey: room.matchKey,
+        message: "Stake deposit required to start the match."
+      });
+      return;
+    }
+
+    room.escrowVerified = true;
+    room.escrowReady = true;
+    io.to(roomId).emit("game_start", { roomId });
+    startMoveTimeout(roomId);
+    log(roomId, "🎮 GAME START (escrow verified)");
+  } catch (e) {
+    err(roomId, "Escrow isFunded check failed:", e.message);
+    // Fallback: ESCROW_CONTRACT missing ho to game start kar do (dev mode)
+    if (!process.env.ESCROW_CONTRACT) {
+      warn(roomId, "ESCROW_CONTRACT not set — dev mode, starting without escrow");
+      room.escrowReady = true;
+      io.to(roomId).emit("game_start", { roomId });
+      startMoveTimeout(roomId);
+      log(roomId, "🎮 GAME START (no escrow contract)");
+    }
+  }
+}
 
 // ─────────────────────────────────────────
 // RPS RESOLUTION
