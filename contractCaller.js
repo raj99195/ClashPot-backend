@@ -1,178 +1,238 @@
 /**
  * ClashPot — on-chain settlement via ClashPotEscrow.sol
  *
- * Ye file server.js se require hoti hai.
- * Environment variables (.env):
- *   MST_RPC_URL        = https://mariorpc.mstblockchain.com
+ * .env:
+ *   MST_RPC_URL         = https://mariorpc.mstblockchain.com
  *   BACKEND_PRIVATE_KEY = settler wallet ki private key (0x se shuru)
- *   ESCROW_CONTRACT    = deployed ClashPotEscrow address
+ *   ESCROW_CONTRACT     = deployed ClashPotEscrow address
  *
- * ⚠️ FLOAT → WEI CONVERSION
- *   8.75 + 1.25 = 10.00 — seedha parseUnits karo to floating point se
- *   9.999999999999998 aa sakta hai aur settle() revert ho jaayega.
- *   Safe formula: p1Wei = parseUnits(p1Score) ; p2Wei = pot - p1Wei
- *   Isse exactly pot == p1Wei + p2Wei guarantee hota hai.
+ * ═══════════════════════════════════════════════════════════════════════════
+ * 🔴 v2 FIX 1 — PAYOUT ORDER (paise ka bug tha)
+ *
+ *   Contract me m.p1 wo hai jisne PEHLE deposit kiya.
+ *   Server me p1 wo hai jisne PEHLE socket join kiya.
+ *   Ye dono zaroori nahi ki same banda ho — dono ko escrow_pending ek saath
+ *   milta hai, aur jo pehle wallet confirm kare wahi contract ka p1 ban jaata hai.
+ *
+ *   Purana code seedha settle(matchId, p1Amount, p2Amount) bhejta tha, matlab
+ *   50% matches me jeetne wale ka paisa haarne wale ko chala jaata.
+ *
+ *   Ab settle se pehle contract se m.p1 / m.p2 ke ADDRESS padhe jaate hain aur
+ *   amounts wallet address se map hote hain — slot se nahi.
+ *
+ * 🔴 v2 FIX 2 — STAKE VERIFICATION
+ *
+ *   Pehle sirf isFunded() check hota tha — "dono ne deposit kiya" par
+ *   "kitna kiya" nahi. Dono mil ke 1 MSTC room me 0.001 daal sakte the;
+ *   phir settle() 2 MSTC baantne ki koshish karti aur revert ho jaati.
+ *   Ab on-chain stake expected value se compare hota hai.
+ * ═══════════════════════════════════════════════════════════════════════════
  */
 
 require("dotenv").config();
 const { ethers } = require("ethers");
 
-// ── Minimal ABI — sirf wahi functions jo hum call karte hain ──────────────
+// Status enum — ClashPotEscrow.sol ke hisaab se
+const STATUS = ["None", "Open", "Funded", "Settled", "Refunded"];
+const STATUS_FUNDED = 2;
+
 const ESCROW_ABI = [
   "function settle(bytes32 matchId, uint256 p1Amount, uint256 p2Amount) external",
   "function isFunded(bytes32 matchId) external view returns (bool)",
   "function getMatch(bytes32 matchId) external view returns (tuple(address p1, address p2, uint256 stake, uint256 pot, uint64 createdAt, uint64 fundedAt, uint8 status))",
-  "function matchIdFor(string calldata roomId) external pure returns (bytes32)",
   "function feeBps() external view returns (uint16)",
 ];
 
-// ── Lazy init — pehli call pe connection banao ────────────────────────────
-let _provider = null;
-let _signer   = null;
 let _contract = null;
+let _signer = null;
 
 function getContract() {
   if (_contract) return _contract;
 
-  const rpc     = process.env.MST_RPC_URL;
+  const rpc = process.env.MST_RPC_URL;
   const privKey = process.env.BACKEND_PRIVATE_KEY;
   const address = process.env.ESCROW_CONTRACT;
 
   if (!rpc || !privKey || !address) {
-    throw new Error(
-      "[ContractCaller] Missing env: MST_RPC_URL / BACKEND_PRIVATE_KEY / ESCROW_CONTRACT"
-    );
+    throw new Error("[ContractCaller] Missing env: MST_RPC_URL / BACKEND_PRIVATE_KEY / ESCROW_CONTRACT");
   }
 
-  _provider = new ethers.JsonRpcProvider(rpc);
-  _signer   = new ethers.Wallet(privKey, _provider);
+  const provider = new ethers.JsonRpcProvider(rpc);
+  _signer = new ethers.Wallet(privKey, provider);
   _contract = new ethers.Contract(address, ESCROW_ABI, _signer);
 
-  console.log("[ContractCaller] Initialized. Escrow:", address, "| Settler:", _signer.address);
+  console.log("[ContractCaller] Ready. Escrow:", address, "| Settler:", _signer.address);
   return _contract;
 }
 
-// ── matchId helper — roomId string → bytes32 keccak ──────────────────────
-// Client side (Unity) aur server side dono yahi formula use karein.
+/** roomKey string → bytes32. Frontend aur contract dono yahi formula use karte hain. */
 function matchIdFor(roomKey) {
   return ethers.keccak256(ethers.toUtf8Bytes(roomKey));
 }
 
-// ── isFunded — server game shuru karne se pehle ye check karega ──────────
-async function isFunded(roomKey) {
+// ─────────────────────────────────────────────────────────────────────────────
+// VERIFY ESCROW — game start se pehle
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Sirf "funded hai kya" nahi — ye bhi check karta hai ki SAHI amount jama hua.
+ *
+ * @param roomKey          server ka matchKey
+ * @param expectedStakeMST per-player stake (1 / 5 / 10)
+ * @returns {ok, reason, p1, p2, potWei}
+ */
+async function verifyEscrow(roomKey, expectedStakeMST) {
   try {
     const contract = getContract();
-    const matchId  = matchIdFor(roomKey);
-    const funded   = await contract.isFunded(matchId);
-    console.log(`[ContractCaller] isFunded(${roomKey}): ${funded}`);
-    return funded;
-  } catch (e) {
-    console.error("[ContractCaller] isFunded failed:", e.message);
-    return false;
-  }
-}
+    const matchId = matchIdFor(roomKey);
+    const m = await contract.getMatch(matchId);
 
-// ── scoreBasedPayout — match result ke baad call hota hai ─────────────────
-//
-// p1Score / p2Score: float MST values (e.g. 8.75, 1.25)
-// stakeMST: per-player stake (e.g. 5)
-// pot = stakeMST * 2 (e.g. 10)
-//
-// Float → Wei safe conversion:
-//   p1Wei = parseUnits(p1Score.toFixed(18))  — lekin .toFixed(18) bhi
-//           floating point artifacts de sakta hai (8.75 → 8.749999...)
-//   SAFE:  p1Wei = parseUnits(p1Score.toFixed(6), 18)  — 6 decimal enough
-//          p2Wei = pot_wei - p1Wei                      — exact complement
-//
-async function scoreBasedPayout(roomKey, p1Wallet, p1Score, p2Wallet, p2Score) {
-  try {
-    const contract = getContract();
-    const matchId  = matchIdFor(roomKey);
+    const status = Number(m.status);
 
-    // Pot = p1Score + p2Score (server ne guarantee kiya hai ye sum = stake*2)
-    const potMST = p1Score + p2Score;
-    const potWei = ethers.parseUnits(potMST.toFixed(6), 18);
-
-    // ✅ Safe float → wei: p1 seedha convert, p2 = pot - p1 (exact sum)
-    const p1Wei  = ethers.parseUnits(p1Score.toFixed(6), 18);
-    const p2Wei  = potWei - p1Wei;
-
-    // Fee contract se padho (0 hoga unless admin ne set kiya)
-    const feeBps    = await contract.feeBps();
-    const feeAmount = (potWei * BigInt(feeBps)) / 10000n;
-    const p1Adj     = p1Wei - (p1Wei * BigInt(feeBps)) / 10000n;
-    const p2Adj     = p2Wei - (p2Wei * BigInt(feeBps)) / 10000n;
-
-    // Contract check: p1Adj + p2Adj + fee == pot
-    const sumCheck = p1Adj + p2Adj + feeAmount;
-    if (sumCheck !== potWei) {
-      // Rounding se 1 wei off ho sakta hai — p2 se adjust karo
-      const diff = potWei - sumCheck;
-      console.warn(`[ContractCaller] Wei sum off by ${diff} — p2 se adjust kar raha hu`);
-      const p2Final = p2Adj + diff;
-
-      console.log(`[ContractCaller] settle() → matchId=${matchId}`);
-      console.log(`  p1=${p1Wallet} gets ${ethers.formatEther(p1Adj)} MSTC`);
-      console.log(`  p2=${p2Wallet} gets ${ethers.formatEther(p2Final)} MSTC`);
-      console.log(`  fee=${ethers.formatEther(feeAmount)} MSTC (${feeBps}bps)`);
-
-      const tx = await contract.settle(matchId, p1Adj, p2Final, {
-        gasLimit: 200000,
-      });
-      const receipt = await tx.wait();
-      console.log(`[ContractCaller] ✅ settled! tx=${receipt.hash}`);
-      return receipt;
+    if (status !== STATUS_FUNDED) {
+      return { ok: false, reason: `status=${STATUS[status] || status} (Funded chahiye)` };
     }
 
-    console.log(`[ContractCaller] settle() → matchId=${matchId}`);
-    console.log(`  p1=${p1Wallet} gets ${ethers.formatEther(p1Adj)} MSTC`);
-    console.log(`  p2=${p2Wallet} gets ${ethers.formatEther(p2Adj)} MSTC`);
-    console.log(`  fee=${ethers.formatEther(feeAmount)} MSTC (${feeBps}bps)`);
+    // Stake exactly match karna chahiye
+    const expectedStakeWei = ethers.parseUnits(String(expectedStakeMST), 18);
+    if (m.stake !== expectedStakeWei) {
+      return {
+        ok: false,
+        reason: `stake mismatch — on-chain=${ethers.formatEther(m.stake)} MSTC, expected=${expectedStakeMST} MSTC`,
+      };
+    }
 
-    const tx = await contract.settle(matchId, p1Adj, p2Adj, {
-      gasLimit: 200000,
-    });
-    const receipt = await tx.wait();
-    console.log(`[ContractCaller] ✅ settled! tx=${receipt.hash}`);
-    return receipt;
+    // Pot = stake × 2
+    const expectedPotWei = expectedStakeWei * 2n;
+    if (m.pot !== expectedPotWei) {
+      return {
+        ok: false,
+        reason: `pot mismatch — on-chain=${ethers.formatEther(m.pot)}, expected=${ethers.formatEther(expectedPotWei)}`,
+      };
+    }
 
+    console.log(
+      `[ContractCaller] ✅ Escrow verified: ${roomKey} | stake=${ethers.formatEther(m.stake)} pot=${ethers.formatEther(m.pot)} MSTC`
+    );
+    console.log(`  on-chain p1=${m.p1}  p2=${m.p2}`);
+
+    return { ok: true, p1: m.p1, p2: m.p2, potWei: m.pot };
   } catch (e) {
-    console.error("[ContractCaller] ❌ settle failed:", e.message);
-
-    // Common reasons:
-    if (e.message.includes("Not funded"))
-      console.error("  → Dono players ne deposit nahi kiya tha");
-    if (e.message.includes("Amounts must equal pot"))
-      console.error("  → Float→wei conversion mismatch — rounding issue");
-    if (e.message.includes("insufficient funds"))
-      console.error("  → Settler wallet mein gas ke liye MSTC nahi");
-
-    throw e;
+    console.error("[ContractCaller] verifyEscrow failed:", e.message);
+    return { ok: false, reason: e.message };
   }
 }
 
-// ── refundPlayers — server down / opponent left (fallback) ────────────────
-// Note: contract mein automatic refund hai (refundExpired) jab timeout ho.
-// Ye function sirf logging ke liye — contract-level refund player khud call karta hai.
+/** Backward compat — sirf funded check. verifyEscrow() prefer karo. */
+async function isFunded(roomKey) {
+  const r = await verifyEscrow(roomKey, null).catch(() => ({ ok: false }));
+  return r.ok;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SETTLE
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Match settle karo.
+ *
+ * ⚠️ p1Wallet/p2Wallet server ke SLOTS hain. Contract ke m.p1/m.p2 deposit
+ *    ORDER hai. Dono alag ho sakte hain — isliye amounts address se map hote hain.
+ */
+async function scoreBasedPayout(roomKey, p1Wallet, p1Score, p2Wallet, p2Score) {
+  const contract = getContract();
+  const matchId = matchIdFor(roomKey);
+
+  // ── On-chain state padho ──
+  const m = await contract.getMatch(matchId);
+  const status = Number(m.status);
+
+  if (status !== STATUS_FUNDED) {
+    throw new Error(`Match ${STATUS[status] || status} hai, Funded nahi — settle skip`);
+  }
+
+  const potWei = m.pot;
+  const feeBps = await contract.feeBps();
+
+  // ── Float → wei (server ka p1/p2) ──
+  // p1Wei seedha convert, p2Wei = pot - p1Wei taaki sum EXACT rahe
+  const serverP1Wei = ethers.parseUnits(p1Score.toFixed(6), 18);
+  const serverP2Wei = potWei - serverP1Wei;
+
+  if (serverP1Wei < 0n || serverP2Wei < 0n) {
+    throw new Error(`Negative amount: p1=${p1Score} p2=${p2Score} pot=${ethers.formatEther(potWei)}`);
+  }
+
+  // ── 🔴 ADDRESS SE MAP KARO, SLOT SE NAHI ──
+  const chainP1 = m.p1.toLowerCase();
+  const chainP2 = m.p2.toLowerCase();
+  const srvP1 = (p1Wallet || "").toLowerCase();
+  const srvP2 = (p2Wallet || "").toLowerCase();
+
+  let amountForChainP1, amountForChainP2;
+
+  if (chainP1 === srvP1 && chainP2 === srvP2) {
+    // Order same — server p1 ne pehle deposit kiya
+    amountForChainP1 = serverP1Wei;
+    amountForChainP2 = serverP2Wei;
+    console.log("[ContractCaller] Deposit order = slot order");
+  } else if (chainP1 === srvP2 && chainP2 === srvP1) {
+    // 🔄 Order ULTA — server p2 ne pehle deposit kiya, amounts swap karo
+    amountForChainP1 = serverP2Wei;
+    amountForChainP2 = serverP1Wei;
+    console.log("[ContractCaller] ⚠ Deposit order ULTA hai — amounts swap kiye");
+  } else {
+    throw new Error(
+      `Wallet mismatch!\n` +
+      `  on-chain: p1=${m.p1} p2=${m.p2}\n` +
+      `  server:   p1=${p1Wallet} p2=${p2Wallet}`
+    );
+  }
+
+  // ── Fee ──
+  const fee = (potWei * BigInt(feeBps)) / 10000n;
+  if (fee > 0n) {
+    // Fee dono se proportionally kaato, phir dust p2 se adjust
+    const f1 = (amountForChainP1 * BigInt(feeBps)) / 10000n;
+    amountForChainP1 -= f1;
+    amountForChainP2 = potWei - fee - amountForChainP1;
+  }
+
+  // ── Invariant: contract yahi check karta hai ──
+  const sum = amountForChainP1 + amountForChainP2 + fee;
+  if (sum !== potWei) {
+    // 1 wei ka dust — p2 se adjust
+    const diff = potWei - sum;
+    amountForChainP2 += diff;
+    console.warn(`[ContractCaller] Dust ${diff} wei — p2 se adjust kiya`);
+  }
+
+  console.log(`[ContractCaller] settle() → ${roomKey}`);
+  console.log(`  ${m.p1} → ${ethers.formatEther(amountForChainP1)} MSTC`);
+  console.log(`  ${m.p2} → ${ethers.formatEther(amountForChainP2)} MSTC`);
+  console.log(`  fee   → ${ethers.formatEther(fee)} MSTC (${feeBps} bps)`);
+
+  const tx = await contract.settle(matchId, amountForChainP1, amountForChainP2, { gasLimit: 250000 });
+  const receipt = await tx.wait();
+  console.log(`[ContractCaller] ✅ settled! tx=${receipt.hash}`);
+  return receipt;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 async function refundPlayers(roomKey, wallets, stakeMST) {
-  console.log(`[ContractCaller] refundPlayers — contract timeout pe auto-refund hoga`);
-  console.log(`  room=${roomKey} wallets=${wallets.join(",")} stake=${stakeMST}`);
-  // Players manually refundExpired() call kar sakte hain timeout ke baad.
-  // Server-triggered refund nahi hota (settler ke paas refund function nahi hai).
+  // Contract me timeout-based refund hai (refundExpired) jo koi bhi call kar sakta hai.
+  // Settler ke paas refund ka koi role nahi — jaan-boojh ke, taaki server
+  // players ka paisa na chhu sake.
+  console.log(`[ContractCaller] refundPlayers — contract timeout pe players khud refundExpired() call karenge`);
+  console.log(`  room=${roomKey} wallets=${(wallets || []).join(", ")} stake=${stakeMST}`);
 }
 
-// ── Startup check ─────────────────────────────────────────────────────────
-function init() {
-  try {
-    getContract();
-  } catch (e) {
-    console.warn("[ContractCaller]", e.message);
-  }
-}
-
-init();
+// Startup pe connection warm karo (env missing ho to sirf warn)
+try { getContract(); } catch (e) { console.warn("[ContractCaller]", e.message); }
 
 module.exports = {
+  verifyEscrow,
   isFunded,
   scoreBasedPayout,
   refundPlayers,

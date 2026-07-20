@@ -170,7 +170,7 @@ io.on("connection", (socket) => {
       if (room.currentTurn === existingId) room.currentTurn = socket.id;
       delete room.players[existingId];
       delete room.scores[existingId];
-      socket.emit("room_joined", { slot: old.slot, roomId });
+      socket.emit("room_joined", { slot: old.slot, roomId, matchKey: room.matchKey, stakeMST: room.stakeMST });
       return;
     }
 
@@ -182,7 +182,7 @@ io.on("connection", (socket) => {
     room.players[socket.id] = { walletAddress, slot };
     room.scores[socket.id] = 0;
 
-    socket.emit("room_joined", { slot, roomId });
+    socket.emit("room_joined", { slot, roomId, matchKey: room.matchKey, stakeMST: room.stakeMST });
     log(roomId, `${walletAddress} joined as ${slot}`, `socket=${socket.id}`);
 
     if (Object.keys(room.players).length === 2) {
@@ -206,16 +206,26 @@ io.on("connection", (socket) => {
     }
   });
 
-  // ── ESCROW CONFIRMED (client deposit ke baad bhejta hai) ──────────
+  // ── ESCROW CONFIRMED ─────────────────────────────────────────────
+  // Client deposit karne ke baad bhejta hai. Dono ka deposit aane pe
+  // contract se isFunded() verify hota hai, phir game_start jaata hai.
   socket.on("escrow_confirmed", ({ roomId, txHash }) => {
     const room = rooms[roomId];
     if (!room) return reject(socket, roomId, "Room not found");
 
     room.escrowDeposits.add(socket.id);
-    log(roomId, `escrow_confirmed ${room.escrowDeposits.size}/2`, `from=${socket.id} tx=${txHash || "none"}`);
+    const slot = room.players[socket.id]?.slot || "?";
+    log(roomId, `escrow_confirmed ${room.escrowDeposits.size}/2`, `${slot} tx=${txHash || "none"}`);
+
+    // Doosre player ko batao ki iska deposit ho gaya (UI ke liye)
+    io.to(roomId).emit("escrow_progress", {
+      deposited: room.escrowDeposits.size,
+      total: 2,
+      slot,
+    });
 
     if (room.escrowDeposits.size >= 2) {
-      log(roomId, "Both deposits confirmed — escrow verify kar raha hu");
+      log(roomId, "Dono deposits aa gaye — contract pe verify kar raha hu");
       tryStartGame(roomId);
     }
   });
@@ -323,7 +333,7 @@ io.on("connection", (socket) => {
             room.scores[remainingId] = room.stakeMST * 2;
             log(roomId, "Walkover payout to remaining player",
               `${room.players[remainingId].walletAddress} = ${room.scores[remainingId]}`);
-            gameManager.triggerScoreBasedPayout(room.matchKey, room.players, room.scores, room.stakeMST);
+            gameManager.triggerScoreBasedPayout(roomId, room.players, room.scores, room.stakeMST);
           }
         } else {
           gameManager.triggerRefund(roomId, room);
@@ -370,9 +380,9 @@ async function tryStartGame(roomId) {
 
   // Escrow contract check
   try {
-    const funded = await contractCaller.isFunded(room.matchKey);
-    if (!funded) {
-      log(roomId, "Escrow not funded yet — dono players ka deposit wait kar raha hu",
+    const check = await contractCaller.verifyEscrow(room.matchKey, room.stakeMST);
+    if (!check.ok) {
+      log(roomId, `Escrow ready nahi — ${check.reason}`,
         `matchKey=${room.matchKey}`);
 
       // Players ko inform karo ki deposit pending hai
@@ -525,7 +535,7 @@ function resolveMatch(roomId) {
       `total=${total} pot=${pot} — generateNineCards check karo`);
   }
 
-  gameManager.triggerScoreBasedPayout(room.matchKey, room.players, room.scores, room.stakeMST);
+  gameManager.triggerScoreBasedPayout(roomId, room.players, room.scores, room.stakeMST);
   cleanup(roomId);
 }
 
