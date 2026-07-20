@@ -323,7 +323,7 @@ io.on("connection", (socket) => {
             room.scores[remainingId] = room.stakeMST * 2;
             log(roomId, "Walkover payout to remaining player",
               `${room.players[remainingId].walletAddress} = ${room.scores[remainingId]}`);
-            gameManager.triggerScoreBasedPayout(roomId, room.players, room.scores, room.stakeMST);
+            gameManager.triggerScoreBasedPayout(room.matchKey, room.players, room.scores, room.stakeMST);
           }
         } else {
           gameManager.triggerRefund(roomId, room);
@@ -525,7 +525,7 @@ function resolveMatch(roomId) {
       `total=${total} pot=${pot} — generateNineCards check karo`);
   }
 
-  gameManager.triggerScoreBasedPayout(roomId, room.players, room.scores, room.stakeMST);
+  gameManager.triggerScoreBasedPayout(room.matchKey, room.players, room.scores, room.stakeMST);
   cleanup(roomId);
 }
 

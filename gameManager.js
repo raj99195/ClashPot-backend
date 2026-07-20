@@ -106,7 +106,7 @@ function getPrefabName(val, stakeMST) {
 // PAYOUT
 // ─────────────────────────────────────────
 
-async function triggerScoreBasedPayout(roomId, players, scores, stakeMST) {
+async function triggerScoreBasedPayout(matchKey, players, scores, stakeMST) {
   try {
     const playerIds = Object.keys(players);
     const p1Id = playerIds.find((id) => players[id].slot === "p1");
@@ -117,12 +117,12 @@ async function triggerScoreBasedPayout(roomId, players, scores, stakeMST) {
     const p1Wallet = players[p1Id]?.walletAddress || "";
     const p2Wallet = players[p2Id]?.walletAddress || "";
 
-    console.log(`[GameManager] Payout → ${p1Wallet}=${p1Score} MST, ${p2Wallet}=${p2Score} MST`);
+    console.log(`[GameManager] Payout → matchKey=${matchKey} | ${p1Wallet}=${p1Score} MST, ${p2Wallet}=${p2Score} MST`);
 
-    await contractCaller.scoreBasedPayout(roomId, p1Wallet, p1Score, p2Wallet, p2Score);
-    console.log(`[GameManager] ✅ Payout tx sent for ${roomId}`);
+    await contractCaller.scoreBasedPayout(matchKey, p1Wallet, p1Score, p2Wallet, p2Score);
+    console.log(`[GameManager] ✅ Payout tx sent for ${matchKey}`);
   } catch (e) {
-    console.error(`[GameManager] ❌ Payout failed for ${roomId}:`, e.message);
+    console.error(`[GameManager] ❌ Payout failed for ${matchKey}:`, e.message);
   }
 }
 
