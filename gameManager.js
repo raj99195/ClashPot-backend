@@ -106,24 +106,66 @@ function getPrefabName(val, stakeMST) {
 // PAYOUT
 // ─────────────────────────────────────────
 
+/**
+ * Match ke baad on-chain payout.
+ *
+ * ⚠️ Pehla param matchKey hai (roomId NAHI). Deposit ke waqt matchId
+ *    keccak(matchKey) se banta hai, toh settle bhi wahi key use kare —
+ *    warna contract pe alag matchId banega aur "Not funded" pe revert hoga
+ *    (paisa contract me fas jaayega).
+ *
+ * MST RPC kabhi-kabhi transient fail karta hai, isliye 3 retries.
+ *
+ * @returns {ok, txHash, error} — server client ko yahi batata hai
+ */
 async function triggerScoreBasedPayout(matchKey, players, scores, stakeMST) {
-  try {
-    const playerIds = Object.keys(players);
-    const p1Id = playerIds.find((id) => players[id].slot === "p1");
-    const p2Id = playerIds.find((id) => players[id].slot === "p2");
+  const playerIds = Object.keys(players);
+  const p1Id = playerIds.find((id) => players[id].slot === "p1");
+  const p2Id = playerIds.find((id) => players[id].slot === "p2");
 
-    const p1Score = round2(scores[p1Id] || 0);
-    const p2Score = round2(scores[p2Id] || 0);
-    const p1Wallet = players[p1Id]?.walletAddress || "";
-    const p2Wallet = players[p2Id]?.walletAddress || "";
+  const p1Score = round2(scores[p1Id] || 0);
+  const p2Score = round2(scores[p2Id] || 0);
+  const p1Wallet = players[p1Id]?.walletAddress || "";
+  const p2Wallet = players[p2Id]?.walletAddress || "";
 
-    console.log(`[GameManager] Payout → matchKey=${matchKey} | ${p1Wallet}=${p1Score} MST, ${p2Wallet}=${p2Score} MST`);
+  console.log(`[GameManager] Payout → matchKey=${matchKey}`);
+  console.log(`  ${p1Wallet} = ${p1Score} MST`);
+  console.log(`  ${p2Wallet} = ${p2Score} MST`);
 
-    await contractCaller.scoreBasedPayout(matchKey, p1Wallet, p1Score, p2Wallet, p2Score);
-    console.log(`[GameManager] ✅ Payout tx sent for ${matchKey}`);
-  } catch (e) {
-    console.error(`[GameManager] ❌ Payout failed for ${matchKey}:`, e.message);
+  const MAX_TRIES = 3;
+  let lastErr = null;
+
+  for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
+    try {
+      const receipt = await contractCaller.scoreBasedPayout(
+        matchKey, p1Wallet, p1Score, p2Wallet, p2Score
+      );
+      const txHash = receipt?.hash || receipt?.transactionHash || "";
+      console.log(`[GameManager] ✅ Payout done (attempt ${attempt}) tx=${txHash}`);
+      return { ok: true, txHash, error: null };
+    } catch (e) {
+      lastErr = e;
+      console.error(`[GameManager] ❌ Payout attempt ${attempt}/${MAX_TRIES} failed:`, e.message);
+
+      // Ye errors retry se theek nahi honge — turant ruk jao
+      const permanent = /Not funded|Funded nahi|Amounts must equal pot|Wallet mismatch|AccessControl/i.test(e.message);
+      if (permanent) {
+        console.error("[GameManager] ⛔ Permanent error — retry bekaar hai");
+        break;
+      }
+
+      if (attempt < MAX_TRIES) {
+        console.log("[GameManager] 5s baad retry...");
+        await new Promise((r) => setTimeout(r, 5000));
+      }
+    }
   }
+
+  console.error(
+    `[GameManager] ⛔ PAYOUT FAILED for ${matchKey} — ` +
+    `paisa contract me hai, players settleTimeout ke baad refundExpired() se nikaal sakte hain`
+  );
+  return { ok: false, txHash: null, error: lastErr?.message || "unknown" };
 }
 
 async function triggerRefund(roomId, room) {

@@ -31,6 +31,8 @@ app.use(express.json());
 
 const rooms = {};
 const moveTimers = {};
+const rematchTimers = {};
+const REMATCH_WINDOW_MS = 60000;   // match ke baad itni der tak rematch offer
 
 // ─────────────────────────────────────────
 // LOGGING
@@ -122,6 +124,24 @@ io.on("connection", (socket) => {
       return reject(socket, roomId, "Invalid payload.", `roomId=${roomId} wallet=${walletAddress}`);
     }
 
+    // ⚠️ Real-money match sirf REAL wallet ke saath.
+    //    RoomBrowserUI ka fallback "0xDEV<guid>" tab banta hai jab ArcadeX SDK
+    //    se wallet nahi milta (jaise game ko iframe ke bahar khola ho).
+    //    Aise wallet se khela match settle nahi ho sakta — contract me
+    //    depositor ka address kuch aur hota hai aur payout mapping fail hoti hai.
+    //    Escrow on ho to yahin rok do, warna paisa fasta hai.
+    const escrowEnabled = process.env.SKIP_ESCROW_CHECK !== "true" && !!process.env.ESCROW_CONTRACT;
+    const looksReal = /^0x[a-fA-F0-9]{40}$/.test(walletAddress);
+
+    if (escrowEnabled && !looksReal) {
+      return reject(socket, roomId,
+        "Wallet not connected. Open the game from ArcadeX.",
+        `wallet=${walletAddress} — dev fallback se real-money match nahi ho sakta`);
+    }
+    if (!looksReal) {
+      warn(roomId, "Dev wallet detected (escrow off, testing mode)", walletAddress);
+    }
+
     socket.join(roomId);
 
     if (!rooms[roomId]) {
@@ -143,6 +163,7 @@ io.on("connection", (socket) => {
         matchKey,                    // unique key for matchId generation
         rpsWinner: null,
         finished: false,
+        rematchVotes: new Set(),   // rematch ke liye kisne haan kaha
       };
       log(roomId, "Room created", `stake=${rooms[roomId].stakeMST} matchKey=${matchKey}`);
     }
@@ -228,6 +249,29 @@ io.on("connection", (socket) => {
       log(roomId, "Dono deposits aa gaye — contract pe verify kar raha hu");
       tryStartGame(roomId);
     }
+  });
+
+  // ── REMATCH REQUEST ──────────────────────────────────────────────
+  // Match khatam hone ke baad Try Again dabane pe aata hai.
+  // Dono ka aane pe room reset hota hai NAYE matchKey ke saath.
+  socket.on("rematch_request", ({ roomId }) => {
+    const room = rooms[roomId];
+    if (!room) return reject(socket, roomId, "Rematch window khatam ho gaya.");
+    if (!room.finished) return reject(socket, roomId, "Match abhi chal raha hai.");
+
+    room.rematchVotes = room.rematchVotes || new Set();
+    room.rematchVotes.add(socket.id);
+
+    const slot = room.players[socket.id]?.slot || "?";
+    log(roomId, `rematch_request ${room.rematchVotes.size}/2`, slot);
+
+    io.to(roomId).emit("rematch_progress", {
+      votes: room.rematchVotes.size,
+      total: 2,
+      slot,
+    });
+
+    if (room.rematchVotes.size >= 2) resetRoomForRematch(roomId);
   });
 
   // ── SUBMIT MOVE ──────────────────────────
@@ -333,7 +377,7 @@ io.on("connection", (socket) => {
             room.scores[remainingId] = room.stakeMST * 2;
             log(roomId, "Walkover payout to remaining player",
               `${room.players[remainingId].walletAddress} = ${room.scores[remainingId]}`);
-            gameManager.triggerScoreBasedPayout(roomId, room.players, room.scores, room.stakeMST);
+            gameManager.triggerScoreBasedPayout(room.matchKey, room.players, room.scores, room.stakeMST);
           }
         } else {
           gameManager.triggerRefund(roomId, room);
@@ -409,6 +453,70 @@ async function tryStartGame(roomId) {
       log(roomId, "🎮 GAME START (no escrow contract)");
     }
   }
+}
+
+// ─────────────────────────────────────────
+// REMATCH
+// ─────────────────────────────────────────
+
+/** Match ke baad rematch ka window kholo. Timeout pe room cleanup. */
+function startRematchWindow(roomId) {
+  const room = rooms[roomId];
+  if (!room) return;
+
+  room.rematchVotes = new Set();
+  log(roomId, `Rematch window open (${REMATCH_WINDOW_MS / 1000}s)`);
+
+  io.to(roomId).emit("rematch_available", { seconds: REMATCH_WINDOW_MS / 1000 });
+
+  if (rematchTimers[roomId]) clearTimeout(rematchTimers[roomId]);
+  rematchTimers[roomId] = setTimeout(() => {
+    if (!rooms[roomId]) return;
+    log(roomId, "Rematch window closed — koi rematch nahi, cleanup");
+    io.to(roomId).emit("rematch_expired", {});
+    cleanup(roomId);
+  }, REMATCH_WINDOW_MS);
+}
+
+/**
+ * Room ko naye match ke liye reset karo.
+ *
+ * ⚠️ matchKey NAYA banana ZAROORI hai — purana matchId contract me Settled
+ *    ho chuka hai aur join() uspe "Match not joinable" de dega.
+ *    Players wahi rehte hain, stake wahi rehta hai.
+ */
+function resetRoomForRematch(roomId) {
+  const room = rooms[roomId];
+  if (!room) return;
+
+  if (rematchTimers[roomId]) { clearTimeout(rematchTimers[roomId]); delete rematchTimers[roomId]; }
+  if (moveTimers[roomId])    { clearTimeout(moveTimers[roomId]);    delete moveTimers[roomId]; }
+
+  const oldKey = room.matchKey;
+  room.matchKey = `${roomId}-${Date.now()}`;
+
+  room.moves          = {};
+  room.nineCards      = [];
+  room.highlighted    = [];
+  room.currentTurn    = null;
+  room.turnCount      = 0;
+  room.rpsWinner      = null;
+  room.finished       = false;
+  room.escrowReady    = false;
+  room.escrowVerified = false;
+  room.readyPlayers   = new Set();
+  room.escrowDeposits = new Set();
+  room.rematchVotes   = new Set();
+
+  for (const id of Object.keys(room.players)) room.scores[id] = 0;
+
+  log(roomId, "🔁 REMATCH — room reset", `old=${oldKey} new=${room.matchKey}`);
+
+  io.to(roomId).emit("rematch_start", {
+    roomId,
+    matchKey: room.matchKey,
+    stakeMST: room.stakeMST,
+  });
 }
 
 // ─────────────────────────────────────────
@@ -535,8 +643,35 @@ function resolveMatch(roomId) {
       `total=${total} pot=${pot} — generateNineCards check karo`);
   }
 
-  gameManager.triggerScoreBasedPayout(roomId, room.players, room.scores, room.stakeMST);
-  cleanup(roomId);
+  // Payout async hai — result aane pe clients ko batao.
+  // ⚠️ Pehle ye fire-and-forget tha: settle fail hone pe sirf server console me
+  //    error jaata tha aur players ko lagta tha paisa mil gaya. Ab UI batata hai.
+  const matchKeyForPayout = room.matchKey;
+  gameManager
+    .triggerScoreBasedPayout(matchKeyForPayout, room.players, room.scores, room.stakeMST)
+    .then((res) => {
+      if (res.ok) {
+        log(roomId, "💸 Payout confirmed", `tx=${res.txHash}`);
+      } else {
+        err(roomId, "PAYOUT FAILED — paisa contract me pada hai", res.error);
+      }
+      io.to(roomId).emit("payout_result", {
+        ok: res.ok,
+        txHash: res.txHash,
+        error: res.error,
+        matchKey: matchKeyForPayout,
+      });
+    })
+    .catch((e) => {
+      err(roomId, "Payout promise threw", e.message);
+      io.to(roomId).emit("payout_result", {
+        ok: false, txHash: null, error: e.message, matchKey: matchKeyForPayout,
+      });
+    });
+
+  // ⚠️ cleanup(roomId) yahan NAHI — pehle rematch ka mauka do.
+  //    Window khatam hone pe khud cleanup ho jaayega.
+  startRematchWindow(roomId);
 }
 
 // ─────────────────────────────────────────
@@ -570,7 +705,8 @@ function startMoveTimeout(roomId) {
 // ─────────────────────────────────────────
 
 function cleanup(roomId) {
-  if (moveTimers[roomId]) { clearTimeout(moveTimers[roomId]); delete moveTimers[roomId]; }
+  if (moveTimers[roomId])    { clearTimeout(moveTimers[roomId]);    delete moveTimers[roomId]; }
+  if (rematchTimers[roomId]) { clearTimeout(rematchTimers[roomId]); delete rematchTimers[roomId]; }
   delete rooms[roomId];
   log(roomId, "Room cleaned up");
 }
