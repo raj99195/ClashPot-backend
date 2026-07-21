@@ -156,12 +156,30 @@ async function scoreBasedPayout(roomKey, p1Wallet, p1Score, p2Wallet, p2Score) {
 
   // ── Float → wei (server ka p1/p2) ──
   // p1Wei seedha convert, p2Wei = pot - p1Wei taaki sum EXACT rahe
-  const serverP1Wei = ethers.parseUnits(p1Score.toFixed(6), 18);
-  const serverP2Wei = potWei - serverP1Wei;
+  let serverP1Wei = ethers.parseUnits(p1Score.toFixed(6), 18);
 
-  if (serverP1Wei < 0n || serverP2Wei < 0n) {
-    throw new Error(`Negative amount: p1=${p1Score} p2=${p2Score} pot=${ethers.formatEther(potWei)}`);
+  // ── Negative score clamp ─────────────────────────────────────────────────
+  //
+  // 9 cards ka sum hamesha pot ke barabar hota hai, lekin negative cards ki
+  // wajah se EK player ka score minus me ja sakta hai
+  // (jaise p1=-0.15, p2=2.15, pot=2.0 — sum sahi, par p1 negative).
+  //
+  // Contract uint256 leta hai, negative bhej hi nahi sakte. Pehle yahan
+  // error throw hota tha — safe tha, par match settle nahi hota tha aur
+  // paisa contract me fas jaata tha.
+  //
+  // Sahi rule: koi apne stake se ZYADA nahi haar sakta. Negative wala 0 pe
+  // clamp, aur poora pot doosre ko. Sum tab bhi exactly pot rehta hai.
+  if (serverP1Wei < 0n) {
+    console.warn(`[ContractCaller] p1 score negative (${p1Score}) — 0 pe clamp, pura pot p2 ko`);
+    serverP1Wei = 0n;
+  } else if (serverP1Wei > potWei) {
+    // p1 > pot ka matlab p2 negative tha
+    console.warn(`[ContractCaller] p2 score negative (${p2Score}) — 0 pe clamp, pura pot p1 ko`);
+    serverP1Wei = potWei;
   }
+
+  const serverP2Wei = potWei - serverP1Wei;
 
   // ── 🔴 ADDRESS SE MAP KARO, SLOT SE NAHI ──
   const chainP1 = m.p1.toLowerCase();
